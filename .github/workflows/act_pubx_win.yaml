@@ -1,0 +1,322 @@
+# act-pubx-workflow: v5 variant=plain sha256=a62a18bede685769
+name: actx windows session
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: 'base64(加密载荷)'
+        required: true
+      os:
+        description: 'runner os'
+        required: false
+        default: 'windows-latest'
+      timeout:
+        description: '有效工作时长(分钟)'
+        required: false
+        default: '240'
+      job_timeout:
+        description: 'job 硬上限(分钟)'
+        required: false
+        default: '260'
+      cache:
+        description: '1=启用缓存, 0=关闭'
+        required: false
+        default: '1'
+      cache_ns:
+        description: '缓存命名空间: 会话=ct, 一次性/客户端=oneoff'
+        required: false
+        default: 'ct'
+      group:
+        description: '组名; 空 = 不用组存储'
+        required: false
+        default: ''
+      store_url:
+        description: '组存储工具下载地址'
+        required: false
+        default: ''
+      store_interval:
+        description: '组存储推送间隔秒(0 = 只在收工推)'
+        required: false
+        default: '900'
+
+jobs:
+  run:
+    runs-on: ${{ github.event.inputs.os || 'windows-latest' }}
+    timeout-minutes: ${{ fromJSON(github.event.inputs.job_timeout || 260) > 360 && 360 || fromJSON(github.event.inputs.job_timeout || 260) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 准备
+        id: prep
+        env:
+          ACT_PUBX_D0: ${{ secrets.ACT_PUBX_D0 }}
+          ACT_PUBX_PAYLOAD: ${{ github.event.inputs.payload }}
+          T0: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          K="$RUNNER_TEMP/d0"; mkdir -p "$K"
+          printf '%s\n' "$ACT_PUBX_D0" > "$K/d0.bin"
+          curl -fsS -H "Authorization: Bearer $T0" -H "Accept: application/vnd.github.raw" -o "$K/e0.bin" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/.act_pubx.pub?ref=$GITHUB_REF_NAME" \
+            || curl -fsS -o "$K/e0.bin" \
+                 "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/.act_pubx.pub" \
+            || echo "::warning::取公开材料失败 → 本轮不做缓存(会话不受影响)"
+          D="$RUNNER_TEMP/actx"; mkdir -p "$D/bin"
+          printf '%s' "$ACT_PUBX_PAYLOAD" | base64 -d > "$D/p.ct"
+          if [ "$(head -c1 "$D/p.ct")" = "{" ]; then
+            command -v jq >/dev/null 2>&1 || { echo "::error::WebCrypto 信封需要 jq(Windows 镜像不保证有)"; exit 1; }
+            ENC="$D/enc"; mkdir -p "$ENC"
+            jq -r .k "$D/p.ct" | base64 -d > "$ENC/cek.bin"
+            jq -r .c "$D/p.ct" | base64 -d > "$ENC/body.bin"
+            openssl pkeyutl -decrypt -inkey "$K/d0.bin" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 -in "$ENC/cek.bin" -out "$ENC/cek.hex"
+            openssl enc -d -aes-256-cbc -K "$(cat "$ENC/cek.hex")" -iv "$(jq -r .n "$D/p.ct")" -in "$ENC/body.bin" -out "$D/p.ps1"
+            rm -f "$ENC/cek.bin" "$ENC/cek.hex" "$ENC/body.bin"
+          else
+            openssl smime -decrypt -binary -inform DER -inkey "$K/d0.bin" -in "$D/p.ct" -out "$D/p.ps1"
+          fi
+          PY="$(command -v python || command -v python3 || true)"
+          if [ -n "$PY" ]; then
+            printf '#!/bin/sh\nexec "%s" "$@"\n' "$PY" > "$D/bin/python3"
+            chmod +x "$D/bin/python3"
+          fi
+          echo "$D/bin" >> "$GITHUB_PATH"
+          cat > "$D/launch.ps1" <<'ACTXLAUNCH'
+          param([string]$Script,[string]$Out,[string]$Err,[string]$PidFile)
+          $p = Start-Process -FilePath 'powershell' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File', $Script -RedirectStandardOutput $Out -RedirectStandardError $Err -WindowStyle Hidden -PassThru
+          Set-Content -Path $PidFile -Value $p.Id -Encoding ascii
+          ACTXLAUNCH
+          CD="$HOME/actcache"; mkdir -p "$CD"
+          echo "cachedir=$CD" >> "$GITHUB_OUTPUT"
+          echo "就绪: 载荷 $D/p.ps1, 缓存目录 $CD"
+
+      - name: 启动会话
+        env:
+          WORK_MIN: ${{ github.event.inputs.timeout || 240 }}
+        run: |
+          set -uo pipefail
+          D="$RUNNER_TEMP/actx"
+          ( cd "$D" && powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$D/launch.ps1")" \
+              "$(cygpath -w "$D/p.ps1")" "$(cygpath -w "$D/session.log")" \
+              "$(cygpath -w "$D/session.err")" "$(cygpath -w "$D/session.pid")" )
+          sleep 3
+          P=$(cat "$D/session.pid" 2>/dev/null || echo "")
+          if [ -z "$P" ]; then echo "::error::会话没起来(没有 pid)"; exit 1; fi
+          echo "✓ 会话已后台启动 (pid $P); 软超时由载荷自己按 $WORK_MIN 分钟收工"
+
+      - name: 恢复缓存
+        id: cacherestore
+        if: github.event.inputs.cache != '0' && steps.prep.outputs.cachedir != ''
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.prep.outputs.cachedir }}
+          key: ${{ runner.os }}-actcache-${{ github.event.inputs.cache_ns }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-actcache-${{ github.event.inputs.cache_ns }}-
+
+      - name: 解密并展开缓存
+        if: github.event.inputs.cache != '0' && steps.prep.outputs.cachedir != ''
+        env:
+          CD: ${{ steps.prep.outputs.cachedir }}
+        run: |
+          set -uo pipefail
+          K="$RUNNER_TEMP/d0"
+          KC="$CD/d.ct"
+          [ -s "$KC" ] || { [ -s "$CD/k.ct" ] && KC="$CD/k.ct"; }
+          if [ ! -s "$CD/lc.tar.ct" ] || [ ! -s "$KC" ]; then
+            echo "无可用缓存(首次运行或未命中) → 从空开始"
+            exit 0
+          fi
+          if ! ACT_CACHE_D=$(openssl smime -decrypt -inform DER -inkey "$K/d0.bin" -in "$KC" 2>/dev/null); then
+            rm -f "$CD/lc.tar.ct" "$KC"
+            echo "::warning::缓存解不开(repo 公开材料与 Secret 不是同一对 → 换过密钥?) → 丢弃这份缓存"
+            exit 0
+          fi
+          export ACT_CACHE_D
+          ST="$HOME/.actcache-incoming"; rm -rf "$ST"; mkdir -p "$ST"
+          if openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ACT_CACHE_D -in "$CD/lc.tar.ct" \
+               | tar -C "$ST" -xf -; then
+            if [ ! -e "$HOME/local-cache" ]; then
+              mv "$ST/local-cache" "$HOME/local-cache"
+            else
+              cp -a "$ST/local-cache/." "$HOME/local-cache/"
+            fi
+            rm -rf "$ST"
+            echo "✓ 缓存已就位: $(du -sh "$HOME/local-cache" 2>/dev/null | cut -f1)"
+          else
+            rm -rf "$ST"
+            echo "::warning::缓存解密/展开失败 → 跳过本次缓存"
+          fi
+
+      - name: 恢复组存储
+        if: github.event.inputs.group != ''
+        env:
+          GRP: ${{ github.event.inputs.group }}
+          SURL: ${{ github.event.inputs.store_url }}
+        run: |
+          set +e
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/actx"
+          B="$RUNNER_TEMP/actx/oci-store"
+          rm -f "$RUNNER_TEMP/actx/grp_restore_ok"
+          if [ ! -s "$B" ]; then
+            if ! curl -fsSL "$SURL" -o "$B"; then
+              echo "::error::组存储: 工具取不到 ($SURL) → 本次从空开始, 并且跳过收工推送"
+              exit 0
+            fi
+            chmod +x "$B"
+          fi
+          GD="$(cygpath -w "$HOME/storage")"
+          mkdir -p "$HOME/storage"
+          "$B" restore "$GD" --tag "$GRP"
+          rc=$?
+          case "$rc" in
+            0) echo "✓ 组存储已就位: ~/storage/$GRP"
+               : > "$RUNNER_TEMP/actx/grp_restore_ok" ;;
+            4) echo "组 '$GRP' 还没有快照(首次) → 从空开始"
+               : > "$RUNNER_TEMP/actx/grp_restore_ok" ;;
+            *) echo "::error::组存储拉取失败 (rc=$rc) → 会话从空目录开始, 收工不推送; 本次改动不会被保存" ;;
+          esac
+          exit 0
+
+      - name: 组存储推送助手
+        if: github.event.inputs.group != ''
+        run: |
+          set +e
+          set -uo pipefail
+          D="$RUNNER_TEMP/actx"
+          mkdir -p "$D"
+          cat > "$D/store_push.sh" <<'ACTXPUSH'
+          #!/bin/bash
+          set +e
+          set -uo pipefail
+          GRP="$1"; SURL="$2"; LBL="${3:-推送}"
+          A="$RUNNER_TEMP/actx"
+          mkdir -p "$A"
+          if [ ! -f "$A/grp_restore_ok" ]; then
+            echo "::error::组存储[$LBL]: 本次开工时没恢复成功 → 不推送(否则会把别人的快照覆盖成空的)"
+            exit 3
+          fi
+          if [ ! -d "$HOME/storage/$GRP" ]; then
+            echo "::warning::组存储[$LBL]: 没有 ~/storage/$GRP (会话没往组存储里写东西) → 不推"
+            exit 4
+          fi
+          D="$(cygpath -w "$HOME/storage/$GRP")"
+          B="$A/oci-store"
+          if [ ! -s "$B" ]; then
+            if ! curl -fsSL "$SURL" -o "$B"; then
+              echo "::error::组存储[$LBL]: 工具取不到 ($SURL) → 不推(本轮改动不会被保存)"
+              exit 5
+            fi
+            chmod +x "$B"
+          fi
+          "$B" backup "$D" --tag "$GRP" -R gh
+          rc=$?
+          case "$rc" in
+            0) echo "✓ 组存储[$LBL]: 已推送 (tag=$GRP)" ;;
+            3) echo "::warning::组存储[$LBL]: 部分已传、快照未提交(rc=3) —— 可安全重跑" ;;
+            4) echo "::warning::组存储[$LBL]: tag '$GRP' 没有可用快照(rc=4)" ;;
+            *) echo "::error::组存储[$LBL]: 推送失败 (rc=$rc)" ;;
+          esac
+          exit "$rc"
+          ACTXPUSH
+          chmod +x "$D/store_push.sh"
+          echo "✓ 组存储推送助手就位: $D/store_push.sh"
+          exit 0
+
+      - name: 等待会话结束
+        env:
+          GRP: ${{ github.event.inputs.group }}
+          SURL: ${{ github.event.inputs.store_url }}
+          SIV: ${{ github.event.inputs.store_interval }}
+        run: |
+          set +e
+          set -uo pipefail
+          D="$RUNNER_TEMP/actx"
+          P=$(cat "$D/session.pid" 2>/dev/null || echo "")
+          if [ -z "$P" ]; then echo "::error::没有会话 pid"; exit 1; fi
+          alive() {
+            kill -0 "$P" 2>/dev/null && return 0
+            powershell -NoProfile -Command "if (Get-Process -Id $P -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"
+          }
+          IV="${SIV:-}"
+          case "$IV" in ''|*[!0-9]*) IV=900 ;; esac
+          if [ -n "$GRP" ] && [ "$IV" -gt 0 ] && [ -x "$D/store_push.sh" ]; then
+            next=$(( $(date +%s) + IV ))
+            echo "组存储: 会话期间每 ${IV}s 增量推送一次"
+          else
+            IV=0
+          fi
+          ( tail -n +1 -F "$D/session.log" 2>/dev/null | grep --line-buffered '^actx: stage ' ) &
+          TP=$!
+          n=0
+          while alive; do
+            if [ "$IV" -gt 0 ] && [ "$(date +%s)" -ge "$next" ]; then
+              n=$((n + 1))
+              echo "---- 组存储定时推送 #$n ----"
+              "$D/store_push.sh" "$GRP" "$SURL" "定时#$n" || true
+              next=$(( $(date +%s) + IV ))
+            fi
+            sleep 5
+          done
+          kill "$TP" 2>/dev/null || true
+          echo "会话已结束"
+          exit 0
+
+      - name: 打包缓存
+        if: always() && github.event.inputs.cache != '0' && steps.prep.outputs.cachedir != ''
+        env:
+          CD: ${{ steps.prep.outputs.cachedir }}
+        run: |
+          set -uo pipefail
+          K="$RUNNER_TEMP/d0"
+          if [ ! -d "$HOME/local-cache" ]; then echo "没有 ~/local-cache → 不保存"; exit 0; fi
+          if [ ! -s "$K/e0.bin" ]; then echo "::warning::缺少公开材料 → 不保存缓存"; exit 0; fi
+          rm -f "$CD/lc.tar.ct" "$CD/d.ct"
+          ACT_CACHE_D=$(openssl rand -hex 32); export ACT_CACHE_D
+          set +e
+          tar --warning=no-file-changed -C "$HOME" -cf - local-cache | \
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:ACT_CACHE_D > "$CD/lc.tar.ct"
+          ps=("${PIPESTATUS[@]}")
+          set -e
+          if [ "${ps[0]}" -le 1 ] && [ "${ps[1]}" -eq 0 ] && [ -s "$CD/lc.tar.ct" ]; then
+            printf '%s' "$ACT_CACHE_D" | openssl smime -encrypt -aes256 -binary -outform DER \
+              "$K/e0.bin" > "$CD/d.ct"
+            echo "✓ 密文 $(du -sh "$CD/lc.tar.ct" | cut -f1) 待上传"
+          else
+            rm -f "$CD/lc.tar.ct" "$CD/d.ct"
+            echo "::warning::打包/加密失败 (tar rc=${ps[0]}, enc rc=${ps[1]}) → 本次不保存"
+          fi
+
+      - name: 保存缓存
+        if: always() && github.event.inputs.cache != '0' && steps.prep.outputs.cachedir != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.prep.outputs.cachedir }}
+          key: ${{ runner.os }}-actcache-${{ github.event.inputs.cache_ns }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 备份组存储
+        if: always() && github.event.inputs.group != ''
+        env:
+          GRP: ${{ github.event.inputs.group }}
+          SURL: ${{ github.event.inputs.store_url }}
+        run: |
+          set +e
+          set -uo pipefail
+          A="$RUNNER_TEMP/actx"
+          if [ -x "$A/store_push.sh" ]; then
+            "$A/store_push.sh" "$GRP" "$SURL" "收工"
+            rc=$?
+          else
+            echo "::error::组存储: 推送助手不在 → 本次不推"
+            rc=9
+          fi
+          if [ "$rc" = 0 ]; then
+            B="$A/oci-store"
+            if [ -s "$B" ]; then
+              "$B" clean --tag "$GRP" --keep "day=3,week=2,month=2" --max 20 || \
+                echo "::warning::组存储: 保留清理失败(不影响本次备份)"
+            fi
+          fi
+          exit 0
